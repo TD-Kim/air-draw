@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>허공 그림판 ✋ Air Draw</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05070d; color: #e8f1ff; overflow: hidden;
+    font-family: -apple-system, "Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans KR", sans-serif;
+    touch-action: none; -webkit-user-select: none; user-select: none; }
+  #stage { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); }
+  #stage video, #stage canvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+  #stage video { transform: scaleX(-1); object-fit: fill; opacity: .6; transition: opacity .3s; }
+  #status { position: fixed; left: 50%; bottom: max(16px, env(safe-area-inset-bottom)); transform: translateX(-50%);
+    padding: 8px 16px; border-radius: 999px; background: rgba(10, 18, 36, .75); border: 1px solid rgba(80, 200, 255, .35);
+    font-size: 15px; white-space: nowrap; backdrop-filter: blur(6px); z-index: 5; }
+  #toast { position: fixed; left: 50%; top: 40%; transform: translate(-50%, -50%) scale(.9); opacity: 0;
+    padding: 14px 26px; border-radius: 14px; background: rgba(20, 30, 55, .9); font-size: 20px; font-weight: 700;
+    transition: all .25s; pointer-events: none; z-index: 6; }
+  #toast.show { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+  #start { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 18px; padding: 24px; text-align: center; z-index: 10;
+    background: radial-gradient(circle at 50% 35%, #142650, #05070d 70%); }
+  #start h1 { margin: 0; font-size: 34px; letter-spacing: -1px;
+    background: linear-gradient(90deg, #33d6ff, #b36bff, #ff3b5c); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  #start p.sub { margin: 0; opacity: .75; }
+  .guide { display: grid; grid-template-columns: auto auto; gap: 10px 14px; text-align: left; font-size: 16px;
+    background: rgba(255, 255, 255, .05); padding: 16px 20px; border-radius: 16px; border: 1px solid rgba(255, 255, 255, .08); }
+  .guide b { font-size: 22px; text-align: center; }
+  #go { font-size: 18px; font-weight: 700; padding: 14px 34px; border: 0; border-radius: 999px; color: #05070d; cursor: pointer;
+    background: linear-gradient(90deg, #33d6ff, #3dff8f); box-shadow: 0 0 24px rgba(51, 214, 255, .5); }
+  #go:disabled { opacity: .5; }
+  #msg { min-height: 1.4em; font-size: 14px; opacity: .85; max-width: 420px; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" playsinline muted autoplay></video>
+  <canvas id="paint"></canvas>
+  <canvas id="ui"></canvas>
+</div>
+<div id="status" hidden>손을 화면에 보여줘 ✋</div>
+<div id="toast"></div>
+
+<div id="start">
+  <h1>허공 그림판</h1>
+  <p class="sub">카메라 앞에서 손가락으로 허공에 그림을 그려봐</p>
+  <div class="guide">
+    <b>☝️</b><span>검지만 펴기 → <strong>그리기</strong></span>
+    <b>✌️</b><span>검지+중지 → <strong>펜 들기 / 메뉴 선택</strong><br><small>위쪽 메뉴에 잠깐 올려두면 선택돼</small></span>
+    <b>🖐️</b><span>손바닥 펴기 → <strong>지우개</strong></span>
+  </div>
+  <button id="go">카메라 켜고 시작</button>
+  <div id="msg">카메라 영상은 서버로 전송되지 않고 기기 안에서만 처리돼</div>
+</div>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const WASM_PATH = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+
+// ---------- 설정 ----------
+const COLORS = ["#ff3b5c", "#ff9f1c", "#ffe14d", "#3dff8f", "#33d6ff", "#b36bff", "#ffffff"];
+const SIZES = [4, 9, 16];              // 640px 기준 펜 굵기 (화면 크기에 비례해서 커짐)
+const SIZE_LABELS = ["얇게", "보통", "굵게"];
+const BG_OPACITY = [0.6, 0.2, 0];      // 카메라 배경: 보통 / 어둡게 / 숨김
+const BG_LABELS = ["보통", "어둡게", "숨김"];
+const SMOOTH = 0.5;                    // 0~1, 작을수록 부드럽지만 반응이 느림
+const STABLE_FRAMES = 3;               // 제스처가 몇 프레임 유지돼야 모드 전환할지 (떨림 방지)
+
+// ---------- 요소 ----------
+const $ = (id) => document.getElementById(id);
+const video = $("video"), paint = $("paint"), ui = $("ui"), stage = $("stage");
+const pctx = paint.getContext("2d"), uctx = ui.getContext("2d");
+const statusEl = $("status"), toastEl = $("toast"), msgEl = $("msg"), goBtn = $("go");
+
+let W = 0, H = 0, unit = 1;            // unit = 화면 크기 배율 (640px 기준)
+let landmarker = null, lastVideoTime = -1;
+let color = COLORS[4], sizeIdx = 1, bgIdx = 0;
+let tools = [], toolbarBottom = 0;
+
+// 손 상태
+let mode = "none", candidate = "none", candCount = 0;
+let cursor = null, last = null, landmarks = null;
+let hoverTool = null, hoverStart = 0, hoverFired = false;
+
+// ---------- 화면 배치 ----------
+function resize() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh) return;
+  if (vw !== W || vh !== H) {
+    let old = null;
+    if (W && H) { old = document.createElement("canvas"); old.width = W; old.height = H; old.getContext("2d").drawImage(paint, 0, 0); }
+    W = vw; H = vh; unit = Math.max(W, H) / 640;
+    paint.width = ui.width = W; paint.height = ui.height = H;
+    if (old) pctx.drawImage(old, 0, 0, W, H);
+    layoutTools();
+  }
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  stage.style.width = W * s + "px";
+  stage.style.height = H * s + "px";
+}
+addEventListener("resize", resize);
+
+function layoutTools() {
+  const items = COLORS.map((c) => ({ type: "color", value: c }))
+    .concat([{ type: "size" }, { type: "bg" }, { type: "clear" }, { type: "save" }]);
+  const n = items.length, pad = Math.max(W * 0.012, 6);
+  const bw = Math.min((W - pad * (n + 1)) / n, H * 0.11);
+  let x = (W - (n * bw + (n - 1) * pad)) / 2;
+  const y = pad * 1.5;
+  tools = items.map((it) => { const t = { ...it, x, y, w: bw, h: bw }; x += bw + pad; return t; });
+  toolbarBottom = y + bw + pad;
+}
+
+function toolAt(p) {
+  return tools.find((t) => p.x >= t.x && p.x <= t.x + t.w && p.y >= t.y && p.y <= t.y + t.h) || null;
+}
+
+// ---------- 메뉴 동작 ----------
+function toast(text) {
+  toastEl.textContent = text;
+  toastEl.classList.add("show");
+  clearTimeout(toast.t);
+  toast.t = setTimeout(() => toastEl.classList.remove("show"), 900);
+}
+
+function runTool(t) {
+  if (t.type === "color") { color = t.value; toast("🎨 색 변경"); }
+  else if (t.type === "size") { sizeIdx = (sizeIdx + 1) % SIZES.length; toast("✏️ " + SIZE_LABELS[sizeIdx]); }
+  else if (t.type === "bg") { bgIdx = (bgIdx + 1) % BG_OPACITY.length; video.style.opacity = BG_OPACITY[bgIdx]; toast("📷 배경 " + BG_LABELS[bgIdx]); }
+  else if (t.type === "clear") { pctx.clearRect(0, 0, W, H); toast("🧹 전부 지움"); }
+  else if (t.type === "save") { saveImage(); }
+}
+
+function saveImage() {
+  const out = document.createElement("canvas");
+  out.width = W; out.height = H;
+  const o = out.getContext("2d");
+  o.fillStyle = "#05070d"; o.fillRect(0, 0, W, H);
+  o.drawImage(paint, 0, 0);
+  const d = new Date(), z = (n) => String(n).padStart(2, "0");
+  const name = `air-draw-${d.getFullYear()}${z(d.getMonth() + 1)}${z(d.getDate())}-${z(d.getHours())}${z(d.getMinutes())}${z(d.getSeconds())}.png`;
+  out.toBlob((blob) => {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+    toast("💾 저장 완료");
+  }, "image/png");
+}
+
+// 화면을 직접 터치/클릭해도 메뉴 선택 가능
+ui.addEventListener("pointerdown", (e) => {
+  if (!W) return;
+  const r = ui.getBoundingClientRect();
+  const p = { x: (e.clientX - r.left) * (W / r.width), y: (e.clientY - r.top) * (H / r.height) };
+  const t = toolAt(p);
+  if (t) runTool(t);
+});
+addEventListener("keydown", (e) => {
+  if (e.key === "c") runTool({ type: "clear" });
+  if (e.key === "s") runTool({ type: "save" });
+});
+
+// ---------- 손 모양 판정 ----------
+const px = (p) => ({ x: (1 - p.x) * W, y: p.y * H });   // 거울 모드 + 픽셀 좌표
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+function fingersUp(lm) {
+  const w = px(lm[0]);
+  const up = (tip, pip) => dist(w, px(lm[tip])) > dist(w, px(lm[pip])) * 1.15;
+  return { index: up(8, 6), middle: up(12, 10), ring: up(16, 14), pinky: up(20, 18) };
+}
+
+function classify(lm) {
+  const f = fingersUp(lm);
+  if (f.index && f.middle && f.ring && f.pinky) return "erase";
+  if (f.index && f.middle && !f.ring && !f.pinky) return "select";
+  if (f.index && !f.middle && !f.ring && !f.pinky) return "draw";
+  return "idle";
+}
+
+function palmCenter(lm) {
+  const pts = [0, 5, 9, 17].map((i) => px(lm[i]));
+  return { x: pts.reduce((s, p) => s + p.x, 0) / 4, y: pts.reduce((s, p) => s + p.y, 0) / 4 };
+}
+
+// ---------- 그리기 ----------
+function strokeLine(a, b) {
+  pctx.globalCompositeOperation = "source-over";
+  pctx.strokeStyle = color;
+  pctx.lineWidth = SIZES[sizeIdx] * unit;
+  pctx.lineCap = "round"; pctx.lineJoin = "round";
+  pctx.shadowColor = color; pctx.shadowBlur = 12 * unit;   // 네온 효과
+  pctx.beginPath(); pctx.moveTo(a.x, a.y); pctx.lineTo(b.x, b.y); pctx.stroke();
+  pctx.shadowBlur = 0;
+}
+
+function eraseLine(a, b) {
+  const r = 36 * unit;
+  pctx.globalCompositeOperation = "destination-out";
+  pctx.lineWidth = r * 2; pctx.lineCap = "round";
+  pctx.beginPath(); pctx.moveTo(a.x, a.y); pctx.lineTo(b.x, b.y); pctx.stroke();
+  pctx.beginPath(); pctx.arc(b.x, b.y, r, 0, Math.PI * 2); pctx.fill();   // 손을 멈춰도 지워지게
+  pctx.globalCompositeOperation = "source-over";
+}
+
+function handleHand(lm) {
+  // 제스처 안정화: 같은 모양이 몇 프레임 이어져야 모드 변경
+  const c = classify(lm);
+  if (c === candidate) candCount++; else { candidate = c; candCount = 1; }
+  if (candCount >= STABLE_FRAMES && mode !== candidate) { mode = candidate; last = null; cursor = null; }
+
+  const target = mode === "erase" ? palmCenter(lm) : px(lm[8]);
+  if (!cursor) cursor = { ...target };
+  else { cursor.x += (target.x - cursor.x) * SMOOTH; cursor.y += (target.y - cursor.y) * SMOOTH; }
+  const p = { ...cursor };
+
+  // 인식이 순간적으로 튀면 선이 쭉 그어지는 것 방지
+  if (last && dist(last, p) > Math.max(W, H) * 0.25) last = null;
+
+  // 다른 손 모양으로 바뀌는 중(아직 확정 전)에는 그리지 않음 → 메뉴로 갈 때 선이 따라오는 것 방지
+  if (mode === "draw" && candidate !== "draw") {
+    last = null;
+  } else if (mode === "draw") {
+    if (p.y < toolbarBottom) { last = null; }
+    else { if (last) strokeLine(last, p); last = p; }
+  } else if (mode === "erase" && candidate === "erase") {
+    eraseLine(last || p, p); last = p;
+  } else {
+    last = null;
+  }
+
+  // 메뉴 선택 (✌️ 상태로 잠깐 올려두기)
+  const t = mode === "select" ? toolAt(p) : null;
+  if (t !== hoverTool) { hoverTool = t; hoverStart = performance.now(); hoverFired = false; }
+  if (t && !hoverFired) {
+    const need = (t.type === "clear" || t.type === "save") ? 900 : 450;
+    if (performance.now() - hoverStart >= need) { runTool(t); hoverFired = true; }
+  }
+}
+
+function noHand() {
+  mode = "none"; candidate = "none"; candCount = 0;
+  cursor = null; last = null; hoverTool = null;
+}
+
+// ---------- 화면 UI ----------
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+
+const ICONS = { size: "✏️", bg: "📷", clear: "🧹", save: "💾" };
+
+function drawUI() {
+  uctx.clearRect(0, 0, W, H);
+
+  // 손 관절 점 (은은하게)
+  if (landmarks) {
+    uctx.fillStyle = "rgba(180, 230, 255, .45)";
+    for (const l of landmarks) { const q = px(l); uctx.beginPath(); uctx.arc(q.x, q.y, 2.5 * unit, 0, Math.PI * 2); uctx.fill(); }
+  }
+
+  // 메뉴
+  for (const t of tools) {
+    const hov = t === hoverTool;
+    roundRect(uctx, t.x, t.y, t.w, t.h, t.w * 0.22);
+    uctx.fillStyle = hov ? "rgba(60, 90, 140, .85)" : "rgba(12, 20, 40, .7)";
+    uctx.fill();
+    uctx.lineWidth = Math.max(1, unit);
+    uctx.strokeStyle = (t.type === "color" && t.value === color) ? "#fff" : "rgba(120, 200, 255, .3)";
+    uctx.stroke();
+    const cx = t.x + t.w / 2, cy = t.y + t.h / 2;
+    if (t.type === "color") {
+      uctx.beginPath(); uctx.arc(cx, cy, t.w * 0.3, 0, Math.PI * 2);
+      uctx.fillStyle = t.value; uctx.shadowColor = t.value; uctx.shadowBlur = t.value === color ? 14 * unit : 0;
+      uctx.fill(); uctx.shadowBlur = 0;
+    } else {
+      uctx.textAlign = "center"; uctx.textBaseline = "middle"; uctx.fillStyle = "#e8f1ff";
+      uctx.font = `${t.w * 0.36}px sans-serif`;
+      uctx.fillText(ICONS[t.type], cx, cy - t.w * 0.1);
+      const label = t.type === "size" ? SIZE_LABELS[sizeIdx] : t.type === "bg" ? BG_LABELS[bgIdx] : t.type === "clear" ? "전체삭제" : "저장";
+      uctx.font = `${t.w * 0.17}px sans-serif`;
+      uctx.fillText(label, cx, cy + t.w * 0.3);
+    }
+    // 선택 진행 링
+    if (hov && !hoverFired) {
+      const need = (t.type === "clear" || t.type === "save") ? 900 : 450;
+      const k = Math.min(1, (performance.now() - hoverStart) / need);
+      uctx.beginPath(); uctx.arc(cx, cy, t.w * 0.46, -Math.PI / 2, -Math.PI / 2 + k * Math.PI * 2);
+      uctx.strokeStyle = "#3dff8f"; uctx.lineWidth = 3 * unit; uctx.stroke();
+    }
+  }
+
+  // 커서
+  if (cursor) {
+    const c = cursor;
+    if (mode === "draw") {
+      uctx.beginPath(); uctx.arc(c.x, c.y, Math.max(SIZES[sizeIdx] * unit * 0.6, 4 * unit), 0, Math.PI * 2);
+      uctx.fillStyle = color; uctx.shadowColor = color; uctx.shadowBlur = 16 * unit; uctx.fill(); uctx.shadowBlur = 0;
+    } else if (mode === "erase") {
+      uctx.setLineDash([6 * unit, 6 * unit]);
+      uctx.beginPath(); uctx.arc(c.x, c.y, 36 * unit, 0, Math.PI * 2);
+      uctx.strokeStyle = "rgba(255, 255, 255, .8)"; uctx.lineWidth = 2 * unit; uctx.stroke();
+      uctx.setLineDash([]);
+    } else {
+      uctx.beginPath(); uctx.arc(c.x, c.y, 10 * unit, 0, Math.PI * 2);
+      uctx.strokeStyle = "#fff"; uctx.lineWidth = 2 * unit; uctx.stroke();
+    }
+  }
+
+  statusEl.textContent =
+    mode === "draw" ? "☝️ 그리는 중" :
+    mode === "select" ? "✌️ 펜 들기 · 메뉴 선택" :
+    mode === "erase" ? "🖐️ 지우개" :
+    landmarks ? "☝️ 검지만 펴면 그려져" : "손을 화면에 보여줘 ✋";
+}
+
+// ---------- 메인 루프 ----------
+function loop() {
+  resize();
+  if (landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    try {
+      const res = landmarker.detectForVideo(video, performance.now());
+      landmarks = res.landmarks && res.landmarks.length ? res.landmarks[0] : null;
+      if (landmarks) handleHand(landmarks); else noHand();
+    } catch (e) { console.error(e); }
+  }
+  if (W) drawUI();
+  requestAnimationFrame(loop);
+}
+
+async function createLandmarker(delegate) {
+  const fileset = await FilesetResolver.forVisionTasks(WASM_PATH);
+  return HandLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: MODEL_URL, delegate },
+    runningMode: "VIDEO",
+    numHands: 1,
+    minHandDetectionConfidence: 0.5,
+    minHandPresenceConfidence: 0.5,
+    minTrackingConfidence: 0.5,
+  });
+}
+
+goBtn.addEventListener("click", async () => {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    msgEl.textContent = "이 브라우저에서는 카메라를 쓸 수 없어. https:// 주소로 열었는지 확인해줘.";
+    return;
+  }
+  goBtn.disabled = true;
+  msgEl.textContent = "카메라 켜는 중...";
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false,
+    });
+    video.srcObject = stream;
+    await video.play();
+  } catch (e) {
+    console.error(e);
+    msgEl.textContent = "카메라를 못 열었어. 브라우저 카메라 권한을 허용하고, 다른 앱이 카메라를 쓰고 있지 않은지 확인해줘.";
+    goBtn.disabled = false;
+    return;
+  }
+
+  msgEl.textContent = "손 인식 모델 불러오는 중... (처음 한 번만, 약 8MB)";
+  try {
+    try { landmarker = await createLandmarker("GPU"); }
+    catch (e) { console.warn("GPU 실패, CPU로 전환", e); landmarker = await createLandmarker("CPU"); }
+  } catch (e) {
+    console.error(e);
+    msgEl.textContent = "손 인식 모델을 못 불러왔어. 인터넷 연결을 확인하고 새로고침해줘.";
+    goBtn.disabled = false;
+    return;
+  }
+
+  $("start").remove();
+  statusEl.hidden = false;
+  resize();
+  requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>
