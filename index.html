@@ -51,7 +51,7 @@
   <p class="sub">카메라 앞에서 손가락으로 허공에 그림을 그려봐</p>
   <div class="guide">
     <b>☝️</b><span>검지만 펴기 → <strong>그리기</strong></span>
-    <b>✌️</b><span>검지+중지 → <strong>펜 들기 / 메뉴 선택</strong><br><small>위쪽 메뉴에 잠깐 올려두면 선택돼</small></span>
+    <b>🤏</b><span>엄지+검지 집기 → <strong>펜 들기 / 메뉴 선택</strong><br><small>집은 채로 위쪽 메뉴에 잠깐 올려두면 선택돼 (✌️도 돼)</small></span>
     <b>🖐️</b><span>손바닥 펴기 → <strong>지우개</strong></span>
   </div>
   <button id="go">카메라 켜고 시작</button>
@@ -202,7 +202,14 @@ function fingersUp(lm) {
   return { index: up(8, 6), middle: up(12, 10), ring: up(16, 14), pinky: up(20, 18) };
 }
 
+// 엄지+검지 집기 판정 (켜질 때/풀릴 때 기준을 다르게 해서 경계에서 깜빡이지 않게)
+const PINCH_ON = 0.35, PINCH_OFF = 0.5;
+let pinched = false;
 function classify(lm) {
+  const handSize = dist(px(lm[0]), px(lm[9])) || 1;
+  const pd = dist(px(lm[4]), px(lm[8])) / handSize;
+  pinched = pinched ? pd < PINCH_OFF : pd < PINCH_ON;
+  if (pinched) return "select";                       // 🤏 집기 = 펜 들기
   const f = fingersUp(lm);
   if (f.index && f.middle && f.ring && f.pinky) return "erase";
   if (f.index && f.middle && !f.ring && !f.pinky) return "select";
@@ -256,7 +263,8 @@ function handleHand(lm) {
   const c = classify(lm);
   if (c === candidate) candCount++; else { candidate = c; candCount = 1; }
   // 그리기 시작은 바로(1프레임), 다른 모드 전환은 STABLE_FRAMES 유지 필요
-  const need = candidate === "draw" ? 1 : STABLE_FRAMES;
+  // 단, 집기를 풀면서 그리기로 갈 땐 손가락 벌어지는 움직임이 선으로 남지 않게 한 프레임 더 기다림
+  const need = candidate === "draw" && mode !== "select" ? 1 : STABLE_FRAMES;
   if (candCount >= need && mode !== candidate) {
     // 그리기 ↔ 메뉴는 같은 검지 끝을 쓰니까 필터 유지 (커서 안 튐), 지우개 전환 때만 초기화
     if (mode === "erase" || candidate === "erase") resetFilter();
@@ -283,7 +291,7 @@ function handleHand(lm) {
     last = null;
   }
 
-  // 메뉴 선택 (✌️ 상태로 잠깐 올려두기)
+  // 메뉴 선택 (🤏 또는 ✌️ 상태로 잠깐 올려두기)
   const t = mode === "select" ? toolAt(p) : null;
   if (t !== hoverTool) { hoverTool = t; hoverStart = performance.now(); hoverFired = false; }
   if (t && !hoverFired) {
@@ -293,6 +301,7 @@ function handleHand(lm) {
 }
 
 function noHand() {
+  pinched = false;
   mode = "none"; candidate = "none"; candCount = 0;
   cursor = null; last = null; hoverTool = null;
   resetFilter();
@@ -369,7 +378,7 @@ function drawUI() {
 
   statusEl.textContent =
     mode === "draw" ? "☝️ 그리는 중" :
-    mode === "select" ? "✌️ 펜 들기 · 메뉴 선택" :
+    mode === "select" ? "🤏 펜 들기 · 메뉴 선택" :
     mode === "erase" ? "🖐️ 지우개" :
     (landmarks ? "☝️ 검지만 펴면 그려져" : "손을 화면에 보여줘 ✋");
   statusEl.textContent += ` · ${fps}fps · ${delegate} ${Math.round(inferMs)}ms`;
