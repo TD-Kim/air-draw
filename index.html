@@ -76,8 +76,8 @@ const BGS = [
   { label: "도화지", icon: "📄", video: 0, board: "paper", save: "#fbfaf5", light: true },
 ];
 // 커서 필터 (One Euro): 천천히 움직일 땐 떨림을 잡고, 빨리 움직일 땐 지연 없이 따라감
-const FILTER_MIN_CUTOFF = 1.2;         // 작을수록 멈춰 있을 때 더 안정적 (대신 살짝 느려짐)
-const FILTER_BETA = 8;                 // 클수록 빠른 움직임에 더 즉각 반응
+const FILTER_MIN_CUTOFF = 1.5;         // 작을수록 멈춰 있을 때 더 안정적 (대신 살짝 느려짐)
+const FILTER_BETA = 20;                // 클수록 빠른 움직임에 더 즉각 반응
 const STABLE_FRAMES = 2;               // 제스처가 몇 프레임 유지돼야 모드 전환할지 (떨림 방지)
 
 // ---------- 요소 ----------
@@ -255,7 +255,9 @@ function handleHand(lm) {
   // 제스처 안정화: 같은 모양이 몇 프레임 이어져야 모드 변경
   const c = classify(lm);
   if (c === candidate) candCount++; else { candidate = c; candCount = 1; }
-  if (candCount >= STABLE_FRAMES && mode !== candidate) {
+  // 그리기 시작은 바로(1프레임), 다른 모드 전환은 STABLE_FRAMES 유지 필요
+  const need = candidate === "draw" ? 1 : STABLE_FRAMES;
+  if (candCount >= need && mode !== candidate) {
     // 그리기 ↔ 메뉴는 같은 검지 끝을 쓰니까 필터 유지 (커서 안 튐), 지우개 전환 때만 초기화
     if (mode === "erase" || candidate === "erase") resetFilter();
     mode = candidate; last = null;
@@ -370,23 +372,33 @@ function drawUI() {
     mode === "select" ? "✌️ 펜 들기 · 메뉴 선택" :
     mode === "erase" ? "🖐️ 지우개" :
     (landmarks ? "☝️ 검지만 펴면 그려져" : "손을 화면에 보여줘 ✋");
-  statusEl.textContent += ` · ${fps}fps`;
+  statusEl.textContent += ` · ${fps}fps · ${delegate} ${Math.round(inferMs)}ms`;
 }
 
 // ---------- 메인 루프 ----------
-let fpsCount = 0, fps = 0, fpsT = performance.now();
+let fpsCount = 0, fps = 0, fpsT = performance.now(), inferMs = 0, delegate = "";
+
+// 손 인식: 카메라에 새 프레임이 들어오는 즉시 실행 (requestVideoFrameCallback)
+// → 아이폰 사파리에서 video.currentTime 갱신이 늦어 프레임을 건너뛰던 문제 해결
+function detect() {
+  if (!landmarker || video.readyState < 2 || !W) return;
+  try {
+    const t = performance.now();
+    const res = landmarker.detectForVideo(video, t);
+    inferMs = inferMs ? inferMs * 0.8 + (performance.now() - t) * 0.2 : performance.now() - t;
+    fpsCount++;
+    landmarks = res.landmarks && res.landmarks.length ? res.landmarks[0] : null;
+    if (landmarks) handleHand(landmarks); else noHand();
+  } catch (e) { console.error(e); }
+}
+const hasRVFC = "requestVideoFrameCallback" in HTMLVideoElement.prototype;
+function onVideoFrame() { detect(); video.requestVideoFrameCallback(onVideoFrame); }
+
+// 화면 그리기는 따로 매 화면 갱신마다
 function loop() {
   if (performance.now() - fpsT >= 1000) { fps = fpsCount; fpsCount = 0; fpsT = performance.now(); }
   resize();
-  if (landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
-    lastVideoTime = video.currentTime;
-    try {
-      const res = landmarker.detectForVideo(video, performance.now());
-      fpsCount++;
-      landmarks = res.landmarks && res.landmarks.length ? res.landmarks[0] : null;
-      if (landmarks) handleHand(landmarks); else noHand();
-    } catch (e) { console.error(e); }
-  }
+  if (!hasRVFC && video.currentTime !== lastVideoTime) { lastVideoTime = video.currentTime; detect(); }
   if (W) drawUI();
   requestAnimationFrame(loop);
 }
@@ -425,8 +437,8 @@ goBtn.addEventListener("click", async () => {
 
   msgEl.textContent = "손 인식 모델 불러오는 중... (처음 한 번만, 약 8MB)";
   try {
-    try { landmarker = await createLandmarker("GPU"); }
-    catch (e) { console.warn("GPU 실패, CPU로 전환", e); landmarker = await createLandmarker("CPU"); }
+    try { landmarker = await createLandmarker("GPU"); delegate = "GPU"; }
+    catch (e) { console.warn("GPU 실패, CPU로 전환", e); landmarker = await createLandmarker("CPU"); delegate = "CPU"; }
   } catch (e) {
     console.error(e);
     msgEl.textContent = "손 인식 모델을 못 불러왔어. 인터넷 연결을 확인하고 새로고침해줘.";
@@ -439,6 +451,7 @@ goBtn.addEventListener("click", async () => {
   statusEl.hidden = false;
   resize();
   requestAnimationFrame(loop);
+  if (hasRVFC) video.requestVideoFrameCallback(onVideoFrame);
 });
 </script>
 </body>
