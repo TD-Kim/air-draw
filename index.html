@@ -70,10 +70,11 @@ const WASM_PATH = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/
 const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
 
 // ---------- 버전 (수정할 때마다 올리기) ----------
-const APP_VERSION = "v1.7";
-const APP_UPDATED = "2026-11-12 20:10";
+const APP_VERSION = "v1.8";
+const APP_UPDATED = "2026-11-12 20:15";
 // v1.0 첫 버전 · v1.1 칠판/도화지 배경 · v1.2~1.3 속도 개선 · v1.4 집기로 펜 들기
 // v1.5 펜 끝 예측 · v1.6 버전 표시 · v1.7 3D 손가락 판정(지우개·집기 오작동 수정)
+// v1.8 그리는 중 끊김 방지, 지우개 조건 강화, 예측 시간 증가
 document.getElementById("verStart").textContent = `${APP_VERSION} · 업데이트 ${APP_UPDATED}`;
 document.getElementById("verTag").textContent = APP_VERSION;
 
@@ -215,31 +216,39 @@ const len3 = (v) => Math.hypot(v.x, v.y, v.z) || 1e-6;
 const dist3 = (a, b) => len3(sub(a, b));
 const cosAt = (a, b, c) => { const u = sub(a, b), v = sub(b, c); return (u.x * v.x + u.y * v.y + u.z * v.z) / (len3(u) * len3(v)); };
 
-// 손가락이 곧게 펴졌는지: 마디(MCP→PIP)와 끝(PIP→TIP) 방향이 거의 일직선이면 펴진 것
-function fingerStraight(w, mcp, pip, dip, tip) {
-  return cosAt(w[mcp], w[pip], w[tip]) > 0.8 && cosAt(w[pip], w[dip], w[tip]) > 0.6;
-}
-function fingersUp(w) {
-  return {
-    index: fingerStraight(w, 5, 6, 7, 8),
-    middle: fingerStraight(w, 9, 10, 11, 12),
-    ring: fingerStraight(w, 13, 14, 15, 16),
-    pinky: fingerStraight(w, 17, 18, 19, 20),
-  };
+// 손가락 굽힘 정도: 1 = 완전히 일직선, 0 이하 = 꺾임
+function straightness(w, mcp, pip, dip, tip) {
+  return Math.min(cosAt(w[mcp], w[pip], w[tip]), cosAt(w[pip], w[dip], w[tip]) + 0.2);
 }
 
 // 엄지+검지 집기 (켜질 때/풀릴 때 기준을 다르게 해서 경계에서 깜빡이지 않게)
 const PINCH_ON = 0.35, PINCH_OFF = 0.6;
 let pinched = false;
-function classify(w) {
+
+function classify(w, lm2d) {
+  const sIndex = straightness(w, 5, 6, 7, 8);
+  const sMiddle = straightness(w, 9, 10, 11, 12);
+  const sRing = straightness(w, 13, 14, 15, 16);
+  const sPinky = straightness(w, 17, 18, 19, 20);
+
+  // 집기
   const pd = dist3(w[4], w[8]) / dist3(w[0], w[9]);   // 손 크기 대비 엄지-검지 거리
-  const f = fingersUp(w);
-  // 집은 상태는 손가락이 확실히 벌어지고 검지가 펴졌을 때만 풀림
-  pinched = pinched ? !(pd > PINCH_OFF && f.index) : pd < PINCH_ON;
+  pinched = pinched ? !(pd > PINCH_OFF && sIndex > 0.6) : pd < PINCH_ON;
   if (pinched) return "select";                       // 🤏 집기 = 펜 들기
-  if (f.index && f.middle && f.ring && f.pinky) return "erase";
-  if (f.index && f.middle && !f.ring && !f.pinky) return "select";
-  if (f.index && !f.middle && !f.ring && !f.pinky) return "draw";
+
+  // 그리는 중에는 기준을 느슨하게 → 손을 돌리거나 검지가 손바닥과 겹쳐 보여도 계속 그려짐
+  const drawing = mode === "draw";
+  const indexUp = sIndex > (drawing ? 0.35 : 0.7);
+  const up = (v) => v > 0.8;                          // 나머지 손가락은 확실히 펴졌을 때만 '펴짐'
+
+  // 지우개: 네 손가락이 확실히 펴지고, 화면에서도 손바닥이 넓게 보여야 함 (손을 돌릴 때 오작동 방지)
+  if (indexUp && up(sMiddle) && up(sRing) && up(sPinky) && !drawing) {
+    const w2 = px(lm2d[0]), base = dist(w2, px(lm2d[9])) || 1;
+    const open = [8, 12, 16, 20].every((i) => dist(w2, px(lm2d[i])) > base * 1.5);
+    return open ? "erase" : "idle";
+  }
+  if (indexUp && up(sMiddle) && !up(sRing) && !up(sPinky)) return "select";
+  if (indexUp && !up(sMiddle) && !up(sRing) && !up(sPinky)) return "draw";
   return "idle";
 }
 
@@ -284,7 +293,7 @@ function makeFilter() {
 let fx = makeFilter(), fy = makeFilter();
 // 예측: 카메라→인식→화면까지 생기는 지연(약 0.1초)만큼 손가락이 갈 위치를 미리 계산해서
 // 펜 끝을 앞당겨 보여줌 (애플 펜슬과 같은 방식). 실제 선은 정확한 위치로만 저장됨
-const PREDICT_SEC = 0.07;              // 얼마나 앞을 내다볼지 (클수록 빠르지만 커브에서 살짝 튐)
+const PREDICT_SEC = 0.09;              // 얼마나 앞을 내다볼지 (클수록 빠르지만 커브에서 살짝 튐)
 let vel = { x: 0, y: 0 }, prevP = null, lastDetT = 0;
 function resetFilter() { fx = makeFilter(); fy = makeFilter(); vel = { x: 0, y: 0 }; prevP = null; }
 function predicted() {
@@ -298,13 +307,13 @@ function predicted() {
 
 function handleHand(lm, world) {
   // 제스처 안정화: 같은 모양이 몇 프레임 이어져야 모드 변경
-  const c = classify(world || lm);
+  const c = classify(world || lm, lm);
   if (c === candidate) candCount++; else { candidate = c; candCount = 1; }
   // 그리기 시작은 바로(1프레임), 다른 모드 전환은 STABLE_FRAMES 유지 필요
   // 단, 집기를 풀면서 그리기로 갈 땐 손가락 벌어지는 움직임이 선으로 남지 않게 한 프레임 더 기다림
   // 지우개는 실수로 지우면 아까우니 더 오래 확인, 집기 풀고 그리기도 한 박자 더 확인
   const need =
-    candidate === "erase" ? 4 :
+    candidate === "erase" ? 6 :
     candidate === "draw" ? (mode === "select" ? 3 : 1) :
     STABLE_FRAMES;
   if (candCount >= need && mode !== candidate) {
