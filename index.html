@@ -44,6 +44,7 @@
   <video id="video" playsinline muted autoplay></video>
   <div id="board"></div>
   <canvas id="paint"></canvas>
+  <canvas id="live"></canvas>
   <canvas id="ui"></canvas>
 </div>
 <div id="status" hidden>손을 화면에 보여줘 ✋</div>
@@ -70,12 +71,13 @@ const WASM_PATH = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/
 const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
 
 // ---------- 버전 (수정할 때마다 올리기) ----------
-const APP_VERSION = "v1.9";
-const APP_UPDATED = "2026-11-12 20:20";
+const APP_VERSION = "v2.0";
+const APP_UPDATED = "2026-11-12 20:30";
 // v1.0 첫 버전 · v1.1 칠판/도화지 배경 · v1.2~1.3 속도 개선 · v1.4 집기로 펜 들기
 // v1.5 펜 끝 예측 · v1.6 버전 표시 · v1.7 3D 손가락 판정(지우개·집기 오작동 수정)
 // v1.8 그리는 중 끊김 방지, 지우개 조건 강화, 예측 시간 증가
 // v1.9 비스듬한 손도 인식(뻗은 정도 판정), 집기 유지 강화
+// v2.0 선을 하나의 곡선으로 부드럽게, 집기 오작동·지우개 인식 개선
 document.getElementById("verStart").textContent = `${APP_VERSION} · 업데이트 ${APP_UPDATED}`;
 document.getElementById("verTag").textContent = APP_VERSION;
 
@@ -97,8 +99,8 @@ const STABLE_FRAMES = 2;               // 제스처가 몇 프레임 유지돼�
 
 // ---------- 요소 ----------
 const $ = (id) => document.getElementById(id);
-const video = $("video"), paint = $("paint"), ui = $("ui"), stage = $("stage");
-const pctx = paint.getContext("2d"), uctx = ui.getContext("2d");
+const video = $("video"), paint = $("paint"), live = $("live"), ui = $("ui"), stage = $("stage");
+const pctx = paint.getContext("2d"), lctx = live.getContext("2d"), uctx = ui.getContext("2d");
 const statusEl = $("status"), toastEl = $("toast"), msgEl = $("msg"), goBtn = $("go");
 
 let W = 0, H = 0, unit = 1;            // unit = 화면 크기 배율 (640px 기준)
@@ -131,10 +133,11 @@ function resize() {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
   const nW = Math.round(cssW * dpr), nH = Math.round(cssH * dpr);
   if (nW !== W || nH !== H) {
+    endStroke();
     let old = null;
     if (W && H) { old = document.createElement("canvas"); old.width = W; old.height = H; old.getContext("2d").drawImage(paint, 0, 0); }
     W = nW; H = nH; unit = Math.max(W, H) / 640;
-    paint.width = ui.width = W; paint.height = ui.height = H;
+    paint.width = live.width = ui.width = W; paint.height = live.height = H; ui.height = H;
     if (old) pctx.drawImage(old, 0, 0, W, H);
     layoutTools();
     stage.style.width = cssW + "px";
@@ -172,11 +175,12 @@ function runTool(t) {
   if (t.type === "color") { color = t.value; toast("🎨 색 변경"); }
   else if (t.type === "size") { sizeIdx = (sizeIdx + 1) % SIZES.length; toast("✏️ " + SIZE_LABELS[sizeIdx]); }
   else if (t.type === "bg") { bgIdx = (bgIdx + 1) % BGS.length; applyBg(); toast(BGS[bgIdx].icon + " 배경: " + BGS[bgIdx].label); }
-  else if (t.type === "clear") { pctx.clearRect(0, 0, W, H); toast("🧹 전부 지움"); }
+  else if (t.type === "clear") { stroke = null; pctx.clearRect(0, 0, W, H); toast("🧹 전부 지움"); }
   else if (t.type === "save") { saveImage(); }
 }
 
 function saveImage() {
+  endStroke();
   const out = document.createElement("canvas");
   out.width = W; out.height = H;
   const o = out.getContext("2d");
@@ -226,15 +230,16 @@ function straightness(w, mcp, pip, dip, tip) {
 // 각도와 달리 손이 옆으로 돌아가 있어도 값이 잘 유지됨
 const ext = (w, mcp, tip) => dist3(w[0], w[tip]) / dist3(w[0], w[mcp]);
 
-// 엄지+검지 집기: 켜지는 건 바로, 풀리는 건 여러 프레임 연속으로 벌어져 있어야 함
+// 엄지+검지 집기: 켜지는 건 바로, 풀리는 건 여러 프레임 연속으로 확실히 벌어져 있어야 함
 const PINCH_ON = 0.45, PINCH_OFF = 0.62, PINCH_RELEASE_FRAMES = 3;
+const DRAW_MIN_GAP = 0.6;   // 그리려면 엄지-검지가 이만큼은 떨어져 있어야 함 (집기 근처 애매한 구간에선 안 그림)
 let pinched = false, releaseCount = 0;
 
 function classify(w, lm2d) {
   const sI = straightness(w, 5, 6, 7, 8), eI = ext(w, 5, 8);
-  const sM = straightness(w, 9, 10, 11, 12), eM = ext(w, 9, 12);
-  const sR = straightness(w, 13, 14, 15, 16), eR = ext(w, 13, 16);
-  const sP = straightness(w, 17, 18, 19, 20), eP = ext(w, 17, 20);
+  const eM = ext(w, 9, 12), sM = straightness(w, 9, 10, 11, 12);
+  const eR = ext(w, 13, 16), sR = straightness(w, 13, 14, 15, 16);
+  const eP = ext(w, 17, 20), sP = straightness(w, 17, 18, 19, 20);
 
   // 집기 (인식이 한두 프레임 흔들려도 펜이 눌리지 않게)
   const pd = dist3(w[4], w[8]) / dist3(w[0], w[9]);   // 손 크기 대비 엄지-검지 거리
@@ -245,25 +250,18 @@ function classify(w, lm2d) {
   }
   if (pinched) return "select";                       // 🤏 집기 = 펜 들기
 
-  // 검지: 각도나 뻗은 정도 중 하나만 만족해도 '펴짐' (정면이 아니어도 인식되게)
-  // 그리는 중에는 기준을 더 느슨하게 → 손을 돌려도 선이 안 끊김
+  // 손가락 펴짐: 손목→끝 거리가 손목→뿌리 거리의 1.5배 이상 (손 방향과 무관)
+  const up = (e, sv) => e > 1.5 || (sv > 0.85 && e > 1.3);
+  const down = (e) => e < 1.45;
   const drawing = mode === "draw";
   const indexUp = drawing ? (eI > 1.3 || sI > 0.35) : (eI > 1.5 || sI > 0.65);
-  const up = (sv, ev) => sv > 0.8 && ev > 1.6;        // 나머지 손가락은 확실히 펴졌을 때만 '펴짐'
-  const middleUp = up(sM, eM), ringUp = up(sR, eR), pinkyUp = up(sP, eP);
 
-  if (indexUp && middleUp) {
-    if (drawing) return "idle";
-    if (ringUp && pinkyUp) {
-      // 지우개: 화면에서도 손바닥이 넓게 보여야 함 (손을 돌릴 때 오작동 방지)
-      const w2 = px(lm2d[0]), base = dist(w2, px(lm2d[9])) || 1;
-      const open = [8, 12, 16, 20].every((i) => dist(w2, px(lm2d[i])) > base * 1.5);
-      return open ? "erase" : "idle";
-    }
-    return !ringUp ? "select" : "idle";
-  }
-  // 그리기: 검지가 중지보다 확실히 더 뻗어 있으면 됨 (약지·새끼 모양은 안 따짐)
-  if (indexUp && (drawing || eI - eM > 0.15)) return "draw";
+  // 🖐️ 지우개: 네 손가락 모두 펴짐
+  if (up(eI, sI) && up(eM, sM) && up(eR, sR) && up(eP, sP)) return "erase";
+  // ✌️ 펜 들기: 검지+중지만 펴짐
+  if (indexUp && up(eM, sM) && down(eR) && down(eP)) return "select";
+  // ☝️ 그리기: 검지가 중지보다 확실히 더 뻗어 있고, 엄지가 검지 끝에서 떨어져 있음
+  if (indexUp && (drawing || eI - eM > 0.2) && pd > DRAW_MIN_GAP) return "draw";
   return "idle";
 }
 
@@ -273,17 +271,54 @@ function palmCenter(lm) {
 }
 
 // ---------- 그리기 ----------
-function strokeLine(a, b) {
-  pctx.globalCompositeOperation = "source-over";
-  pctx.strokeStyle = color;
-  pctx.lineWidth = SIZES[sizeIdx] * unit;
-  pctx.lineCap = "round"; pctx.lineJoin = "round";
-  pctx.shadowColor = color; pctx.shadowBlur = 12 * unit;   // 네온 효과
-  pctx.beginPath(); pctx.moveTo(a.x, a.y); pctx.lineTo(b.x, b.y); pctx.stroke();
-  pctx.shadowBlur = 0;
+// 지금 그리고 있는 선은 점 목록으로 들고 있다가, 매 화면마다 '한 번에 하나의 곡선'으로 다시 그림
+// → 조각 이음매마다 빛이 겹쳐 점처럼 보이던 문제 해결, 손가락 사이 구간도 부드러운 곡선으로 연결
+let stroke = null;   // { color, width, pts: [{x,y}] }
+
+function tracePath(ctx, pts) {
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, pts[0].y);
+  if (pts.length === 1) { ctx.lineTo(pts[0].x + 0.01, pts[0].y); return; }
+  for (let i = 1; i < pts.length - 1; i++) {
+    const mx = (pts[i].x + pts[i + 1].x) / 2, my = (pts[i].y + pts[i + 1].y) / 2;
+    ctx.quadraticCurveTo(pts[i].x, pts[i].y, mx, my);
+  }
+  const l = pts[pts.length - 1];
+  ctx.lineTo(l.x, l.y);
+}
+
+// 네온 효과: 넓고 옅은 선 2겹 + 본선 (shadowBlur보다 훨씬 가벼움)
+function renderStroke(ctx, st, pts) {
+  if (!pts.length) return;
+  ctx.globalCompositeOperation = "source-over";
+  ctx.lineCap = "round"; ctx.lineJoin = "round";
+  ctx.strokeStyle = st.color;
+  tracePath(ctx, pts);
+  for (const [k, a] of [[4.2, 0.05], [3.2, 0.07], [2.4, 0.1], [1.6, 0.16]]) {   // 바깥으로 갈수록 옅게
+    ctx.globalAlpha = a; ctx.lineWidth = st.width * k; ctx.stroke();
+  }
+  ctx.globalAlpha = 1; ctx.lineWidth = st.width; ctx.stroke();
+}
+
+function addPoint(p) {
+  if (!stroke) { stroke = { color, width: SIZES[sizeIdx] * unit, pts: [p] }; return; }
+  const l = stroke.pts[stroke.pts.length - 1];
+  if (dist(l, p) < 1.5 * unit) return;                 // 거의 안 움직였으면 점 추가 안 함
+  stroke.pts.push(p);
+  // 아주 긴 선은 앞부분을 그림판에 확정해서 매 프레임 그리는 양을 제한
+  if (stroke.pts.length > 300) {
+    renderStroke(pctx, stroke, stroke.pts.slice(0, -20));
+    stroke.pts = stroke.pts.slice(-21);
+  }
+}
+
+function endStroke() {
+  if (stroke && stroke.pts.length) renderStroke(pctx, stroke, stroke.pts);
+  stroke = null;
 }
 
 function eraseLine(a, b) {
+  endStroke();
   const r = 36 * unit;
   pctx.globalCompositeOperation = "destination-out";
   pctx.lineWidth = r * 2; pctx.lineCap = "round";
@@ -321,6 +356,7 @@ function predicted() {
 }
 
 function handleHand(lm, world) {
+  lastSeen = performance.now();
   // 제스처 안정화: 같은 모양이 몇 프레임 이어져야 모드 변경
   const c = classify(world || lm, lm);
   if (c === candidate) candCount++; else { candidate = c; candCount = 1; }
@@ -328,12 +364,13 @@ function handleHand(lm, world) {
   // 단, 집기를 풀면서 그리기로 갈 땐 손가락 벌어지는 움직임이 선으로 남지 않게 한 프레임 더 기다림
   // 지우개는 실수로 지우면 아까우니 더 오래 확인, 집기 풀고 그리기도 한 박자 더 확인
   const need =
-    candidate === "erase" ? 6 :
-    candidate === "draw" ? (mode === "select" ? 2 : 1) :
+    candidate === "erase" ? 4 :
+    candidate === "draw" ? (mode === "select" ? 3 : 2) :
     STABLE_FRAMES;
   if (candCount >= need && mode !== candidate) {
     // 그리기 ↔ 메뉴는 같은 검지 끝을 쓰니까 필터 유지 (커서 안 튐), 지우개 전환 때만 초기화
     if (mode === "erase" || candidate === "erase") resetFilter();
+    if (mode === "draw") endStroke();
     mode = candidate; last = null;
   }
 
@@ -349,14 +386,14 @@ function handleHand(lm, world) {
   prevP = p; lastDetT = now;
 
   // 인식이 순간적으로 튀면 선이 쭉 그어지는 것 방지
-  if (last && dist(last, p) > Math.max(W, H) * 0.25) last = null;
+  if (last && dist(last, p) > Math.max(W, H) * 0.25) { last = null; endStroke(); }
 
-  // 다른 손 모양으로 바뀌는 중(아직 확정 전)에는 그리지 않음 → 메뉴로 갈 때 선이 따라오는 것 방지
+  // 다른 손 모양으로 바뀌는 중(아직 확정 전)에는 점을 추가하지 않음 → 메뉴로 갈 때 선이 따라오는 것 방지
   if (mode === "draw" && candidate !== "draw") {
-    last = null;
+    // 잠깐 멈춤 (선은 유지, 모양이 확정되면 이어서 그리거나 끝냄)
   } else if (mode === "draw") {
-    if (p.y < toolbarBottom) { last = null; }
-    else { if (last) strokeLine(last, p); last = p; }
+    if (p.y < toolbarBottom) { last = null; endStroke(); }
+    else { addPoint(p); last = p; }
   } else if (mode === "erase" && candidate === "erase") {
     eraseLine(last || p, p); last = p;
   } else {
@@ -372,7 +409,11 @@ function handleHand(lm, world) {
   }
 }
 
+// 손 인식이 한두 프레임 끊겨도 상태(집기 등)를 바로 잊지 않음 → 다시 잡힐 때 펜이 눌리는 것 방지
+let lastSeen = 0;
 function noHand() {
+  if (performance.now() - lastSeen < 300) { endStroke(); last = null; return; }
+  endStroke();
   pinched = false; releaseCount = 0;
   mode = "none"; candidate = "none"; candCount = 0;
   cursor = null; last = null; hoverTool = null;
@@ -428,11 +469,13 @@ function drawUI() {
     }
   }
 
-  // 그리는 중이면 예측 구간을 임시로 이어 그림 (다음 프레임에 실제 선으로 대체됨)
+  // 지금 그리는 선 + 예측 구간을 하나의 곡선으로 매 화면 다시 그림 (60fps로 부드럽게 늘어남)
   const pred = mode === "erase" ? cursor : predicted();
-  if (pred && mode === "draw" && candidate === "draw" && last && pred.y > toolbarBottom) {
-    uctx.strokeStyle = color; uctx.lineWidth = SIZES[sizeIdx] * unit; uctx.lineCap = "round";
-    uctx.beginPath(); uctx.moveTo(last.x, last.y); uctx.lineTo(pred.x, pred.y); uctx.stroke();
+  lctx.clearRect(0, 0, W, H);
+  if (stroke) {
+    const pts = (pred && mode === "draw" && candidate === "draw" && pred.y > toolbarBottom)
+      ? stroke.pts.concat([pred]) : stroke.pts;
+    renderStroke(lctx, stroke, pts);
   }
 
   // 커서 (예측 위치에 표시 → 손가락에 더 붙어 보임)
