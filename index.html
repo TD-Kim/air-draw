@@ -9,8 +9,11 @@
     font-family: -apple-system, "Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans KR", sans-serif;
     touch-action: none; -webkit-user-select: none; user-select: none; }
   #stage { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); }
-  #stage video, #stage canvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+  #stage video, #stage canvas, #board { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
   #stage video { transform: scaleX(-1); object-fit: fill; opacity: .6; transition: opacity .3s; }
+  #board { position: absolute; left: 0; top: 0; width: 100%; height: 100%; opacity: 0; transition: opacity .3s, background .3s; }
+  #board.chalk { opacity: 1; background: radial-gradient(ellipse at 50% 40%, #2e5443, #1d3a2c 75%); box-shadow: inset 0 0 0 10px #6b4a2b, inset 0 0 40px rgba(0,0,0,.5); }
+  #board.paper { opacity: 1; background: #fbfaf5; }
   #status { position: fixed; left: 50%; bottom: max(16px, env(safe-area-inset-bottom)); transform: translateX(-50%);
     padding: 8px 16px; border-radius: 999px; background: rgba(10, 18, 36, .75); border: 1px solid rgba(80, 200, 255, .35);
     font-size: 15px; white-space: nowrap; backdrop-filter: blur(6px); z-index: 5; }
@@ -36,6 +39,7 @@
 <body>
 <div id="stage">
   <video id="video" playsinline muted autoplay></video>
+  <div id="board"></div>
   <canvas id="paint"></canvas>
   <canvas id="ui"></canvas>
 </div>
@@ -61,11 +65,16 @@ const WASM_PATH = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/
 const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
 
 // ---------- 설정 ----------
-const COLORS = ["#ff3b5c", "#ff9f1c", "#ffe14d", "#3dff8f", "#33d6ff", "#b36bff", "#ffffff"];
+const COLORS = ["#ff3b5c", "#ff9f1c", "#ffe14d", "#3dff8f", "#33d6ff", "#b36bff", "#ffffff", "#1b1b1f"];
 const SIZES = [4, 9, 16];              // 640px 기준 펜 굵기 (화면 크기에 비례해서 커짐)
 const SIZE_LABELS = ["얇게", "보통", "굵게"];
-const BG_OPACITY = [0.6, 0.2, 0];      // 카메라 배경: 보통 / 어둡게 / 숨김
-const BG_LABELS = ["보통", "어둡게", "숨김"];
+// 배경 모드: 카메라 / 카메라 어둡게 / 칠판 / 도화지
+const BGS = [
+  { label: "카메라", icon: "📷", video: 0.6, board: "", save: "#05070d", light: false },
+  { label: "어둡게", icon: "🌙", video: 0.2, board: "", save: "#05070d", light: false },
+  { label: "칠판", icon: "🟩", video: 0, board: "chalk", save: "#244634", light: false },
+  { label: "도화지", icon: "📄", video: 0, board: "paper", save: "#fbfaf5", light: true },
+];
 const SMOOTH = 0.5;                    // 0~1, 작을수록 부드럽지만 반응이 느림
 const STABLE_FRAMES = 3;               // 제스처가 몇 프레임 유지돼야 모드 전환할지 (떨림 방지)
 
@@ -78,6 +87,15 @@ const statusEl = $("status"), toastEl = $("toast"), msgEl = $("msg"), goBtn = $(
 let W = 0, H = 0, unit = 1;            // unit = 화면 크기 배율 (640px 기준)
 let landmarker = null, lastVideoTime = -1;
 let color = COLORS[4], sizeIdx = 1, bgIdx = 0;
+const board = $("board");
+function applyBg() {
+  const b = BGS[bgIdx];
+  video.style.opacity = b.video;
+  board.className = b.board;
+  document.body.style.background = b.board === "paper" ? "#efede6" : b.board === "chalk" ? "#16291f" : "#05070d";
+  try { localStorage.setItem("airdraw-bg", bgIdx); } catch (e) {}
+}
+try { const v = parseInt(localStorage.getItem("airdraw-bg"), 10); if (v >= 0 && v < BGS.length) bgIdx = v; } catch (e) {}
 let tools = [], toolbarBottom = 0;
 
 // 손 상태
@@ -106,12 +124,14 @@ addEventListener("resize", resize);
 function layoutTools() {
   const items = COLORS.map((c) => ({ type: "color", value: c }))
     .concat([{ type: "size" }, { type: "bg" }, { type: "clear" }, { type: "save" }]);
-  const n = items.length, pad = Math.max(W * 0.012, 6);
-  const bw = Math.min((W - pad * (n + 1)) / n, H * 0.11);
-  let x = (W - (n * bw + (n - 1) * pad)) / 2;
-  const y = pad * 1.5;
-  tools = items.map((it) => { const t = { ...it, x, y, w: bw, h: bw }; x += bw + pad; return t; });
-  toolbarBottom = y + bw + pad;
+  // 세로 화면(폰)이면 메뉴를 2줄로 → 버튼이 너무 작아지지 않게
+  const n = items.length, rows = W < H ? 2 : 1, cols = Math.ceil(n / rows);
+  const pad = Math.max(W * 0.012, 6);
+  const bw = Math.min((W - pad * (cols + 1)) / cols, H * 0.11);
+  const x0 = (W - (cols * bw + (cols - 1) * pad)) / 2, y0 = pad * 1.5;
+  tools = items.map((it, i) => ({ ...it, x: x0 + (i % cols) * (bw + pad), y: y0 + Math.floor(i / cols) * (bw + pad), w: bw, h: bw }));
+  toolbarBottom = y0 + rows * bw + (rows - 1) * pad + pad;
+  window.__tools = tools;
 }
 
 function toolAt(p) {
@@ -129,7 +149,7 @@ function toast(text) {
 function runTool(t) {
   if (t.type === "color") { color = t.value; toast("🎨 색 변경"); }
   else if (t.type === "size") { sizeIdx = (sizeIdx + 1) % SIZES.length; toast("✏️ " + SIZE_LABELS[sizeIdx]); }
-  else if (t.type === "bg") { bgIdx = (bgIdx + 1) % BG_OPACITY.length; video.style.opacity = BG_OPACITY[bgIdx]; toast("📷 배경 " + BG_LABELS[bgIdx]); }
+  else if (t.type === "bg") { bgIdx = (bgIdx + 1) % BGS.length; applyBg(); toast(BGS[bgIdx].icon + " 배경: " + BGS[bgIdx].label); }
   else if (t.type === "clear") { pctx.clearRect(0, 0, W, H); toast("🧹 전부 지움"); }
   else if (t.type === "save") { saveImage(); }
 }
@@ -138,7 +158,7 @@ function saveImage() {
   const out = document.createElement("canvas");
   out.width = W; out.height = H;
   const o = out.getContext("2d");
-  o.fillStyle = "#05070d"; o.fillRect(0, 0, W, H);
+  o.fillStyle = BGS[bgIdx].save; o.fillRect(0, 0, W, H);
   o.drawImage(paint, 0, 0);
   const d = new Date(), z = (n) => String(n).padStart(2, "0");
   const name = `air-draw-${d.getFullYear()}${z(d.getMonth() + 1)}${z(d.getDate())}-${z(d.getHours())}${z(d.getMinutes())}${z(d.getSeconds())}.png`;
@@ -262,7 +282,7 @@ function drawUI() {
 
   // 손 관절 점 (은은하게)
   if (landmarks) {
-    uctx.fillStyle = "rgba(180, 230, 255, .45)";
+    uctx.fillStyle = BGS[bgIdx].light ? "rgba(40, 70, 120, .35)" : "rgba(180, 230, 255, .45)";
     for (const l of landmarks) { const q = px(l); uctx.beginPath(); uctx.arc(q.x, q.y, 2.5 * unit, 0, Math.PI * 2); uctx.fill(); }
   }
 
@@ -280,11 +300,12 @@ function drawUI() {
       uctx.beginPath(); uctx.arc(cx, cy, t.w * 0.3, 0, Math.PI * 2);
       uctx.fillStyle = t.value; uctx.shadowColor = t.value; uctx.shadowBlur = t.value === color ? 14 * unit : 0;
       uctx.fill(); uctx.shadowBlur = 0;
+      uctx.strokeStyle = "rgba(255, 255, 255, .35)"; uctx.lineWidth = Math.max(1, unit); uctx.stroke();
     } else {
       uctx.textAlign = "center"; uctx.textBaseline = "middle"; uctx.fillStyle = "#e8f1ff";
       uctx.font = `${t.w * 0.36}px sans-serif`;
-      uctx.fillText(ICONS[t.type], cx, cy - t.w * 0.1);
-      const label = t.type === "size" ? SIZE_LABELS[sizeIdx] : t.type === "bg" ? BG_LABELS[bgIdx] : t.type === "clear" ? "전체삭제" : "저장";
+      uctx.fillText(t.type === "bg" ? BGS[bgIdx].icon : ICONS[t.type], cx, cy - t.w * 0.1);
+      const label = t.type === "size" ? SIZE_LABELS[sizeIdx] : t.type === "bg" ? BGS[bgIdx].label : t.type === "clear" ? "전체삭제" : "저장";
       uctx.font = `${t.w * 0.17}px sans-serif`;
       uctx.fillText(label, cx, cy + t.w * 0.3);
     }
@@ -303,13 +324,16 @@ function drawUI() {
     if (mode === "draw") {
       uctx.beginPath(); uctx.arc(c.x, c.y, Math.max(SIZES[sizeIdx] * unit * 0.6, 4 * unit), 0, Math.PI * 2);
       uctx.fillStyle = color; uctx.shadowColor = color; uctx.shadowBlur = 16 * unit; uctx.fill(); uctx.shadowBlur = 0;
+      uctx.strokeStyle = BGS[bgIdx].light ? "rgba(0, 0, 0, .6)" : "rgba(255, 255, 255, .8)"; uctx.lineWidth = 1.5 * unit; uctx.stroke();
     } else if (mode === "erase") {
       uctx.setLineDash([6 * unit, 6 * unit]);
       uctx.beginPath(); uctx.arc(c.x, c.y, 36 * unit, 0, Math.PI * 2);
-      uctx.strokeStyle = "rgba(255, 255, 255, .8)"; uctx.lineWidth = 2 * unit; uctx.stroke();
+      uctx.strokeStyle = "rgba(0, 0, 0, .5)"; uctx.lineWidth = 4 * unit; uctx.stroke();
+      uctx.strokeStyle = "rgba(255, 255, 255, .9)"; uctx.lineWidth = 2 * unit; uctx.stroke();
       uctx.setLineDash([]);
     } else {
       uctx.beginPath(); uctx.arc(c.x, c.y, 10 * unit, 0, Math.PI * 2);
+      uctx.strokeStyle = "rgba(0, 0, 0, .55)"; uctx.lineWidth = 5 * unit; uctx.stroke();
       uctx.strokeStyle = "#fff"; uctx.lineWidth = 2 * unit; uctx.stroke();
     }
   }
@@ -380,6 +404,7 @@ goBtn.addEventListener("click", async () => {
   }
 
   $("start").remove();
+  applyBg();
   statusEl.hidden = false;
   resize();
   requestAnimationFrame(loop);
